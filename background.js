@@ -25,6 +25,7 @@ chrome.webRequest.onHeadersReceived.addListener(
         if (header.name.toLowerCase() === 'content-type') {
           const contentType = header.value.toLowerCase();
           if (contentType.startsWith('video/') ||
+              contentType.startsWith('audio/') ||
               contentType === 'application/vnd.apple.mpegurl' || // m3u8
               contentType === 'application/x-mpegurl') {
             isVideo = true;
@@ -32,6 +33,11 @@ chrome.webRequest.onHeadersReceived.addListener(
           break;
         }
       }
+    }
+
+    // For XHR and Fetch, only rely on extension or content-type checks above
+    if (!isVideo && (type === 'xmlhttprequest' || type === 'fetch' || type === 'other')) {
+       // Only allow if it passes the fallback extension check below
     }
 
     // Fallback: Check extension if other methods failed
@@ -89,12 +95,32 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
-// Provide the current list when requested
+// Handle messages from content script and sidebar
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'GET_VIDEOS') {
     const tabId = request.tabId;
     const videos = detectedVideos.has(tabId) ? Array.from(detectedVideos.get(tabId)) : [];
     sendResponse({ videos: videos });
     return true;
+  } else if (request.type === 'DOM_VIDEOS_DETECTED') {
+    const tabId = sender.tab ? sender.tab.id : null;
+    if (tabId && request.urls) {
+      if (!detectedVideos.has(tabId)) {
+        detectedVideos.set(tabId, new Set());
+      }
+      const tabVideos = detectedVideos.get(tabId);
+
+      request.urls.forEach(url => {
+        if (!tabVideos.has(url)) {
+          tabVideos.add(url);
+          // Notify sidebar
+          chrome.runtime.sendMessage({
+            type: 'VIDEO_DETECTED',
+            tabId: tabId,
+            url: url
+          }).catch(() => {});
+        }
+      });
+    }
   }
 });

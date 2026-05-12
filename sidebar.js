@@ -97,7 +97,7 @@ function addVideoToList(url) {
     Download
   `;
   btn.onclick = () => {
-    downloadVideo(url, filename);
+    downloadVideo(url, filename, itemDiv);
   };
 
   actionsDiv.appendChild(btn);
@@ -108,15 +108,129 @@ function addVideoToList(url) {
   list.appendChild(itemDiv);
 }
 
-function downloadVideo(url, defaultFilename) {
-  // Handle m3u8 specifically (HLS streams are usually not directly downloadable as single files)
+function downloadVideo(url, defaultFilename, itemDiv) {
   if (url.includes('.m3u8')) {
-      alert("This is an HLS streaming playlist (.m3u8). Downloading it will only save the playlist file, not the full video. You typically need specialized software (like youtube-dl or ffmpeg) to download these.");
+    downloadHLS(url, defaultFilename, itemDiv);
+  } else {
+    chrome.downloads.download({
+      url: url,
+      filename: defaultFilename,
+      saveAs: true
+    });
   }
+}
 
-  chrome.downloads.download({
-    url: url,
-    filename: defaultFilename,
-    saveAs: true // Prompt the user for where to save
-  });
+async function downloadHLS(playlistUrl, defaultFilename, itemDiv) {
+  const btn = itemDiv.querySelector('.video-download-btn');
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+
+  try {
+    btn.textContent = 'Fetching playlist...';
+
+    // 1. Fetch the initial m3u8
+    let response = await fetch(playlistUrl);
+    let playlistContent = await response.text();
+    let baseUrl = new URL('.', playlistUrl).href;
+
+    // 2. Check if it's a master playlist (contains EXT-X-STREAM-INF)
+    if (playlistContent.includes('#EXT-X-STREAM-INF')) {
+      // Find the highest quality stream
+      const lines = playlistContent.split('\n');
+      let highestBandwidth = 0;
+      let bestStreamUrl = '';
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.startsWith('#EXT-X-STREAM-INF')) {
+          const match = line.match(/BANDWIDTH=(\d+)/);
+          if (match && parseInt(match[1]) > highestBandwidth) {
+            highestBandwidth = parseInt(match[1]);
+            bestStreamUrl = lines[i+1].trim();
+          }
+        }
+      }
+
+      if (bestStreamUrl) {
+        if (!bestStreamUrl.startsWith('http')) {
+           bestStreamUrl = new URL(bestStreamUrl, baseUrl).href;
+        }
+        playlistUrl = bestStreamUrl;
+        baseUrl = new URL('.', playlistUrl).href;
+        response = await fetch(playlistUrl);
+        playlistContent = await response.text();
+      }
+    }
+
+    // 3. Parse media playlist for segment URLs (.ts, .m4s, etc)
+    const lines = playlistContent.split('\n');
+    const segments = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#')) {
+        let segmentUrl = trimmed;
+        if (!segmentUrl.startsWith('http')) {
+          segmentUrl = new URL(segmentUrl, baseUrl).href;
+        }
+        segments.push(segmentUrl);
+      }
+    }
+
+    if (segments.length === 0) {
+      throw new Error('No segments found in playlist');
+    }
+
+    // 4. Download all segments
+    const total = segments.length;
+    const buffers = [];
+
+    for (let i = 0; i < segments.length; i++) {
+      btn.textContent = `Downloading... ${Math.round((i / total) * 100)}%`;
+
+      const segRes = await fetch(segments[i]);
+      if (!segRes.ok) throw new Error(`Failed to fetch segment ${i}`);
+      const arrayBuffer = await segRes.arrayBuffer();
+      buffers.push(arrayBuffer);
+    }
+
+    btn.textContent = 'Processing...';
+
+    // 5. Concatenate buffers
+    const totalLength = buffers.reduce((acc, buf) => acc + buf.byteLength, 0);
+    const combined = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const buf of buffers) {
+      combined.set(new Uint8Array(buf), offset);
+      offset += buf.byteLength;
+    }
+
+    // 6. Create Blob and Download
+    // Note: The resulting file is usually an MPEG-TS stream.
+    // Changing extension from .m3u8 to .ts is safer.
+    let finalFilename = defaultFilename;
+    if (finalFilename.endsWith('.m3u8')) {
+       finalFilename = finalFilename.replace('.m3u8', '.ts');
+    }
+
+    const blob = new Blob([combined], { type: 'video/mp2t' });
+    const objectUrl = URL.createObjectURL(blob);
+
+    chrome.downloads.download({
+      url: objectUrl,
+      filename: finalFilename,
+      saveAs: true
+    }, () => {
+      // Cleanup object URL after a short delay
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10000);
+    });
+
+    btn.innerHTML = originalHtml;
+    btn.disabled = false;
+
+  } catch (err) {
+    console.error(err);
+    alert('Failed to download HLS stream: ' + err.message);
+    btn.innerHTML = originalHtml;
+    btn.disabled = false;
+  }
 }
